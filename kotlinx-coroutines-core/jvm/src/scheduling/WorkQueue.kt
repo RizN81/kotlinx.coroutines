@@ -110,20 +110,26 @@ internal class WorkQueue {
         victim: WorkQueue,
         globalQueue: GlobalQueue
     ): Long {
-        val lastScheduled = victim.lastScheduledTask.value ?: return NOTHING_TO_STEAL
-        // TODO time wraparound ?
-        val time = schedulerTimeSource.nanoTime()
-        val staleness = time - lastScheduled.submissionTime
-        if (staleness < WORK_STEALING_TIME_RESOLUTION_NS) {
-            return WORK_STEALING_TIME_RESOLUTION_NS - staleness
+        while (true) {
+            val lastScheduled = victim.lastScheduledTask.value ?: return NOTHING_TO_STEAL
+            // TODO time wraparound ?
+            val time = schedulerTimeSource.nanoTime()
+            val staleness = time - lastScheduled.submissionTime
+            if (staleness < WORK_STEALING_TIME_RESOLUTION_NS) {
+                return WORK_STEALING_TIME_RESOLUTION_NS - staleness
+            }
+
+            /*
+             * If CAS has failed, either someone else had stolen this task or the owner executed this task
+             * and dispatched another one. In the latter case we should retry to avoid missing task.
+             */
+            if (victim.lastScheduledTask.compareAndSet(lastScheduled, null)) {
+                add(lastScheduled, globalQueue)
+                return TASK_STOLEN
+            }
+            continue
         }
 
-        // TODO this CAS looks like a race
-        if (victim.lastScheduledTask.compareAndSet(lastScheduled, null)) {
-            add(lastScheduled, globalQueue)
-            return TASK_STOLEN
-        }
-        return NOTHING_TO_STEAL
     }
 
     internal fun size(): Int = if (lastScheduledTask.value != null) bufferSize + 1 else bufferSize
