@@ -49,7 +49,7 @@ import kotlin.random.*
  *
  * ### Dynamic resizing and support of blocking tasks
  *
- * To support possibly blocking tasks [TaskMode] and CPU quota (via [cpuPermits]) are used.
+ * To support possibly blocking tasks [TaskMode] and CPU quota (via cpu permits in control state) are used.
  * To execute [TaskMode.NON_BLOCKING] tasks from the global queue or to steal tasks from other workers
  * the worker should have CPU permit. When a worker starts executing [TaskMode.PROBABLY_BLOCKING] task,
  * it releases its CPU permit, giving a hint to a scheduler that additional thread should be created (or awaken)
@@ -60,10 +60,10 @@ import kotlin.random.*
  */
 @Suppress("NOTHING_TO_INLINE")
 internal class CoroutineScheduler(
-    private val corePoolSize: Int,
-    private val maxPoolSize: Int,
-    private val idleWorkerKeepAliveNs: Long = IDLE_WORKER_KEEP_ALIVE_NS,
-    private val schedulerName: String = DEFAULT_SCHEDULER_NAME
+    @JvmField val corePoolSize: Int,
+    @JvmField val maxPoolSize: Int,
+    @JvmField val idleWorkerKeepAliveNs: Long = IDLE_WORKER_KEEP_ALIVE_NS,
+    @JvmField val schedulerName: String = DEFAULT_SCHEDULER_NAME
 ) : Executor, Closeable {
     init {
         require(corePoolSize >= MIN_SUPPORTED_POOL_SIZE) {
@@ -81,14 +81,6 @@ internal class CoroutineScheduler(
     }
 
     private val globalQueue: GlobalQueue = GlobalQueue()
-
-    /**
-     * Permits to execute non-blocking (~CPU-intensive) tasks.
-     * If worker owns a permit, it can schedule non-blocking tasks to its queue and steal work from other workers.
-     * If worker doesn't, it can execute only blocking tasks (and non-blocking leftovers from its local queue)
-     * and will try to park as soon as its queue is empty.
-     */
-    private val cpuPermits = Semaphore(corePoolSize, false)
 
     /**
      * The stack of parker workers.
@@ -232,22 +224,42 @@ internal class CoroutineScheduler(
 
     /**
      * Long describing state of workers in this pool.
-     * Currently includes created and blocking workers each occupying [BLOCKING_SHIFT] bits.
+     * Currently includes created, CPU-acquired and blocking workers each occupying [BLOCKING_SHIFT] bits.
      */
-    private val controlState = atomic(0L)
-
+    private val controlState = atomic(corePoolSize.toLong() shl CPU_PERMITS_SHIFT)
     private val createdWorkers: Int inline get() = (controlState.value and CREATED_MASK).toInt()
     private val blockingWorkers: Int inline get() = (controlState.value and BLOCKING_MASK shr BLOCKING_SHIFT).toInt()
+    private val availableCpuPermits: Int inline get() = (controlState.value and CPU_PERMITS_MASK shr CPU_PERMITS_SHIFT).toInt()
 
     private inline fun createdWorkers(state: Long): Int = (state and CREATED_MASK).toInt()
     private inline fun blockingWorkers(state: Long): Int = (state and BLOCKING_MASK shr BLOCKING_SHIFT).toInt()
+    private inline fun availablePermits(state: Long): Int = (state and CPU_PERMITS_MASK shr CPU_PERMITS_SHIFT).toInt()
 
     // Guarded by synchronization
     private inline fun incrementCreatedWorkers(): Int = createdWorkers(controlState.incrementAndGet())
     private inline fun decrementCreatedWorkers(): Int = createdWorkers(controlState.getAndDecrement())
 
-    private inline fun incrementBlockingWorkers() { controlState.addAndGet(1L shl BLOCKING_SHIFT) }
-    private inline fun decrementBlockingWorkers() { controlState.addAndGet(-(1L shl BLOCKING_SHIFT)) }
+    private inline fun incrementBlockingWorkers() {
+        controlState.addAndGet(1L shl BLOCKING_SHIFT)
+    }
+
+    private inline fun decrementBlockingWorkers() {
+        controlState.addAndGet(-(1L shl BLOCKING_SHIFT))
+    }
+
+    private inline fun tryAcquireCpuPermit(): Boolean {
+        while (true) {
+            val state = controlState.value
+            val available = availablePermits(state)
+            if (available == 0) return false
+            val update = state - (1L shl CPU_PERMITS_SHIFT)
+            if (controlState.compareAndSet(state, update)) return true
+        }
+    }
+
+    private inline fun releaseCpuPermit() {
+        controlState.addAndGet(1L shl CPU_PERMITS_SHIFT)
+    }
 
     // This is used a "stop signal" for close and shutdown functions
     private val _isTerminated = atomic(false)
@@ -272,6 +284,8 @@ internal class CoroutineScheduler(
         private const val BLOCKING_SHIFT = 21 // 2M threads max
         private const val CREATED_MASK: Long = (1L shl BLOCKING_SHIFT) - 1
         private const val BLOCKING_MASK: Long = CREATED_MASK shl BLOCKING_SHIFT
+        private const val CPU_PERMITS_SHIFT = BLOCKING_SHIFT * 2
+        private const val CPU_PERMITS_MASK = CREATED_MASK shl CPU_PERMITS_SHIFT
 
         internal const val MIN_SUPPORTED_POOL_SIZE = 1 // we support 1 for test purposes, but it is not usually used
         internal const val MAX_SUPPORTED_POOL_SIZE = (1 shl BLOCKING_SHIFT) - 2
@@ -317,7 +331,7 @@ internal class CoroutineScheduler(
         // Shutdown current thread
         currentWorker?.tryReleaseCpu(WorkerState.TERMINATED)
         // check & cleanup state
-        assert { cpuPermits.availablePermits() == corePoolSize }
+        assert { availableCpuPermits == corePoolSize }
         parkedWorkersStack.value = 0L
         controlState.value = 0L
     }
@@ -363,7 +377,7 @@ internal class CoroutineScheduler(
      */
     private fun requestCpuWorker() {
         // No CPU available -- nothing to request
-        if (cpuPermits.availablePermits() == 0) {
+        if (availableCpuPermits == 0) {
             tryUnpark()
             return
         }
@@ -454,7 +468,7 @@ internal class CoroutineScheduler(
             val cpuWorkers = created - blocking
             // Double check for overprovision
             if (cpuWorkers >= corePoolSize) return 0
-            if (created >= maxPoolSize || cpuPermits.availablePermits() == 0) return 0
+            if (created >= maxPoolSize || availableCpuPermits == 0) return 0
             // start & register new worker, commit index only after successful creation
             val newIndex = createdWorkers + 1
             require(newIndex > 0 && workers[newIndex] == null)
@@ -675,7 +689,7 @@ internal class CoroutineScheduler(
         fun tryAcquireCpuPermit(): Boolean {
             return when {
                 state == WorkerState.CPU_ACQUIRED -> true
-                cpuPermits.tryAcquire() -> {
+                this@CoroutineScheduler.tryAcquireCpuPermit() -> {
                     state = WorkerState.CPU_ACQUIRED
                     true
                 }
@@ -690,7 +704,7 @@ internal class CoroutineScheduler(
         internal fun tryReleaseCpu(newState: WorkerState): Boolean {
             val previousState = state
             val hadCpu = previousState == WorkerState.CPU_ACQUIRED
-            if (hadCpu) cpuPermits.release()
+            if (hadCpu) releaseCpuPermit()
             if (previousState != newState) state = newState
             return hadCpu
         }
@@ -765,7 +779,7 @@ internal class CoroutineScheduler(
              * If we have idle CPU and the current worker is exhausted, wake up one more worker.
              * Check last exhaustion time to avoid the race between steal and next task execution
              */
-            if (cpuPermits.availablePermits() == 0) {
+            if (availableCpuPermits == 0) {
                 return
             }
             val now = schedulerTimeSource.nanoTime()
