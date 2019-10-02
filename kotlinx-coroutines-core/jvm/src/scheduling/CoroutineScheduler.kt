@@ -80,7 +80,8 @@ internal class CoroutineScheduler(
         }
     }
 
-    private val globalQueue: GlobalQueue = GlobalQueue()
+    @JvmField
+    val globalQueue: GlobalQueue = GlobalQueue()
 
     /**
      * The stack of parker workers.
@@ -105,7 +106,7 @@ internal class CoroutineScheduler(
      *
      * Note, [newIndex] can be zero for the worker that is being terminated (removed from [workers]).
      */
-    private fun parkedWorkersStackTopUpdate(worker: Worker, oldIndex: Int, newIndex: Int) {
+    internal fun parkedWorkersStackTopUpdate(worker: Worker, oldIndex: Int, newIndex: Int) {
         parkedWorkersStack.loop { top ->
             val index = (top and PARKED_INDEX_MASK).toInt()
             val updVersion = (top + PARKED_VERSION_INC) and PARKED_VERSION_MASK
@@ -133,7 +134,7 @@ internal class CoroutineScheduler(
      * Returns `true` if worker was added to the stack by this invocation, `false` if it was already
      * registered in the stack.
      */
-    private fun parkedWorkersStackPush(worker: Worker): Boolean {
+    internal fun parkedWorkersStackPush(worker: Worker): Boolean {
         if (worker.nextParkedWorker !== NOT_IN_STACK) return false // already in stack, bail out
         /*
          * The below loop can be entered only if this worker was not in the stack and, since no other thread
@@ -220,7 +221,8 @@ internal class CoroutineScheduler(
      * workers are 1-indexed, code path in [Worker.trySteal] is a bit faster and index swap during termination
      * works properly
      */
-    private val workers = AtomicReferenceArray<Worker?>(maxPoolSize + 1)
+    @JvmField
+    val workers = AtomicReferenceArray<Worker?>(maxPoolSize + 1)
 
     /**
      * Long describing state of workers in this pool.
@@ -263,11 +265,12 @@ internal class CoroutineScheduler(
 
     // This is used a "stop signal" for close and shutdown functions
     private val _isTerminated = atomic(false)
-    private val isTerminated: Boolean get() = _isTerminated.value
+    val isTerminated: Boolean get() = _isTerminated.value
 
     companion object {
         // A symbol to mark workers that are not in parkedWorkersStack
-        private val NOT_IN_STACK = Symbol("NOT_IN_STACK")
+        @JvmField
+        val NOT_IN_STACK = Symbol("NOT_IN_STACK")
 
         // Local queue 'add' results
         private const val ADDED = -1
@@ -375,7 +378,7 @@ internal class CoroutineScheduler(
     /**
      * Unparks or creates a [Worker] for executing non-blocking tasks if there are idle cores
      */
-    private fun requestCpuWorker() {
+    internal fun requestCpuWorker() {
         // No CPU available -- nothing to request
         if (availableCpuPermits == 0) {
             tryUnpark()
@@ -597,7 +600,7 @@ internal class CoroutineScheduler(
                 "]"
     }
 
-    private fun runSafely(task: Task) {
+    internal fun runSafely(task: Task) {
         try {
             task.run()
         } catch (e: Throwable) {
