@@ -236,16 +236,21 @@ public actual open class LockFreeLinkedListNode {
      * In particular, invoking [nextNode].[prevNode] might still return this node even though it is "already removed".
      * Invoke [helpRemove] to make sure that remove was completed.
      */
-    public actual open fun remove(): Boolean {
+    public actual open fun remove(): Boolean =
+        removeOrNext() == null
+
+    // returns null if removed successfully or next node if this node is already removed
+    @PublishedApi
+    internal fun removeOrNext(): Node? {
         while (true) { // lock-free loop on next
             val next = this.next
-            if (next is Removed) return false // was already removed -- don't try to help (original thread will take care)
-            if (next === this) return false // was not even added
+            if (next is Removed) return next.ref // was already removed -- don't try to help (original thread will take care)
+            if (next === this) return next // was not even added
             val removed = (next as Node).removed()
             if (_next.compareAndSet(next, removed)) {
                 // was removed successfully (linearized remove) -- fixup the list
                 next.correctPrev(null, false)
-                return true
+                return null
             }
         }
     }
@@ -283,13 +288,29 @@ public actual open class LockFreeLinkedListNode {
 
     // just peek at item when predicate is true
     public actual inline fun <reified T> removeFirstIfIsInstanceOfOrPeekIf(predicate: (T) -> Boolean): T? {
-        while (true) { // try to linearize
-            val first = next as Node
-            if (first === this) return null
-            if (first !is T) return null
-            if (predicate(first)) return first // just peek when predicate is true
-            if (first.remove()) return first
-            first.helpRemove() // must help remove to ensure lock-freedom
+        startFromHead@ while(true) {
+            var first = this.next as Node
+            var moveNextAttempts = 0
+            while (true) { // try to linearize
+                if (first === this) return null // got list head -- nothing to remove
+                if (first !is T) return null
+                if (predicate(first)) return first // just peek when predicate is true
+                val next = first.removeOrNext()
+                if (next === null) return first // removed successfully -- return it
+                /*
+                 * This code is needed to reduce starvation in ConflatedChannel receiver that ties to remove a node
+                 * from the head of its queue while sender threads are constantly removing and adding new nodes.
+                 * So, upon discovery of a removed node we don't immediately rush to help with its removal.
+                 * We try to quickly move to the next node to see if we can remove it instead.
+                 * However, we limit the number of attempts to move to the next node and help with removal at the end.
+                 */
+                if (moveNextAttempts++ < 8) {
+                    first = next
+                } else {
+                    first.helpRemove() // help remove this one and retry from the beginning of the list
+                    continue@startFromHead
+                }
+            }
         }
     }
 
